@@ -44,3 +44,6 @@ Desktop.ini
 *.log
 *.tmp
 *.bak
+
+# Sauvegardes locales Docker
+docker-compose.*.backup.yml
