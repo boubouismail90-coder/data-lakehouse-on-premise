@@ -1,0 +1,180 @@
+﻿x-airflow-common: &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME}
+  restart: unless-stopped
+
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET} 
+
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY}
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+
+    RUSTFS_ENDPOINT_URL: http://rustfs:9000
+    RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY}
+    RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY}
+    RUSTFS_REGION: us-east-1
+
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/config:/opt/airflow/config
+    - ./airflow/plugins:/opt/airflow/plugins
+
+  user: "${AIRFLOW_UID}:0"
+
+  networks:
+    - lakehouse-network
+
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+  rustfs:
+    image: ${RUSTFS_IMAGE}
+    container_name: lakehouse-rustfs
+    restart: unless-stopped
+
+    security_opt:
+      - no-new-privileges:true
+
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS: "*"
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY}
+      RUSTFS_OBS_LOGGER_LEVEL: info
+
+    ports:
+      - "${RUSTFS_API_PORT}:9000"
+      - "${RUSTFS_CONSOLE_PORT}:9001"
+
+    volumes:
+      - rustfs-data:/data
+
+    networks:
+      - lakehouse-network
+
+    healthcheck:
+      test:
+        - CMD
+        - sh
+        - -ec
+        - >
+          curl -fsS http://127.0.0.1:9000/health &&
+          curl -fsS http://127.0.0.1:9001/rustfs/console/health
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  postgres:
+    image: postgres:16
+    container_name: lakehouse-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+
+    ports:
+      - "${POSTGRES_PORT}:5432"
+
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+    networks:
+      - lakehouse-network
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: lakehouse-airflow-init
+    restart: "no"
+
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USERNAME}" \
+          --password "${AIRFLOW_ADMIN_PASSWORD}" \
+          --firstname "${AIRFLOW_ADMIN_FIRSTNAME}" \
+          --lastname "${AIRFLOW_ADMIN_LASTNAME}" \
+          --role Admin \
+          --email "${AIRFLOW_ADMIN_EMAIL}" || true
+
+  airflow-api-server:
+    <<: *airflow-common
+    container_name: lakehouse-airflow-api-server
+
+    command: api-server
+
+    ports:
+      - "8080:8080"
+
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - http://localhost:8080/api/v2/monitor/health
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: lakehouse-airflow-scheduler
+
+    command: scheduler
+
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - --fail
+        - http://localhost:8974/health
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: lakehouse-airflow-dag-processor
+
+    command: dag-processor
+
+volumes:
+  postgres-data:
+    name: lakehouse-postgres-data
+
+  rustfs-data:
+    name: lakehouse-rustfs-data
+
+networks:
+  lakehouse-network:
+    name: lakehouse-network
+    driver: bridge
