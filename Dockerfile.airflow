@@ -1,0 +1,71 @@
+# ============================================================
+# STAGE 1
+# Récupération de Spark 3.5.1 depuis l'image Spark officielle
+# déjà utilisée par le projet.
+# ============================================================
+
+FROM spark:3.5.1 AS spark-distribution
+
+
+# ============================================================
+# STAGE 2
+# Image Airflow du projet
+# ============================================================
+
+FROM apache/airflow:3.3.0-python3.12
+
+
+# ------------------------------------------------------------
+# Passage temporaire en root pour installer Java.
+# Spark a besoin de Java pour exécuter spark-submit.
+# ------------------------------------------------------------
+
+USER root
+
+
+# ------------------------------------------------------------
+# Installation d'un runtime Java.
+# Pas d'installation Hadoop séparée :
+# Spark contient déjà les bibliothèques Hadoop nécessaires.
+# ------------------------------------------------------------
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        openjdk-17-jre-headless \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+
+# ------------------------------------------------------------
+# Copie de Spark 3.5.1 depuis l'image officielle Spark.
+# On évite ainsi de télécharger manuellement une autre
+# distribution ou d'avoir une version différente du cluster.
+# ------------------------------------------------------------
+
+COPY --from=spark-distribution /opt/spark /opt/spark
+
+
+# ------------------------------------------------------------
+# Variables Spark
+# ------------------------------------------------------------
+
+ENV SPARK_HOME=/opt/spark
+
+ENV PATH="${SPARK_HOME}/bin:${PATH}"
+
+
+# ------------------------------------------------------------
+# Retour à l'utilisateur Airflow standard.
+# Les services Airflow ne doivent pas fonctionner en root.
+# ------------------------------------------------------------
+
+USER airflow
+
+
+# ------------------------------------------------------------
+# Vérification effectuée pendant le build.
+# Si spark-submit n'est pas correctement installé,
+# la construction de l'image échouera immédiatement.
+# ------------------------------------------------------------
+
+RUN spark-submit --version

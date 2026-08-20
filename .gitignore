@@ -47,3 +47,10 @@ Desktop.ini
 
 # Sauvegardes locales Docker
 docker-compose.*.backup.yml
+
+# Données générées par les traitements Spark
+data/bronze/
+data/silver/
+data/silver-delta/
+data/gold-delta/
+data/delta-test/
