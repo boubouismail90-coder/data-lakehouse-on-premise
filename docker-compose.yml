@@ -46,6 +46,29 @@
 
 
 services:
+  metabase:
+    image: metabase/metabase:latest
+    container_name: lakehouse-metabase
+    hostname: metabase
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    ports:
+      - "3000:3000"
+
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase_db
+      MB_DB_PORT: "5432"
+      MB_DB_USER: lakehouse_admin
+      MB_DB_PASS: ${POSTGRES_PASSWORD}
+      MB_DB_HOST: postgres
+      JAVA_TIMEZONE: Africa/Casablanca
+
+    networks:
+      - lakehouse-network
 
   spark:
     image: spark:3.5.1
@@ -64,6 +87,11 @@ services:
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY}
       RUSTFS_REGION: ${RUSTFS_REGION}
+      BI_DB_HOST: ${BI_DB_HOST}
+      BI_DB_PORT: ${BI_DB_PORT}
+      BI_DB_NAME: ${BI_DB_NAME}
+      BI_DB_USER: ${BI_DB_USER}
+      BI_DB_PASSWORD: ${BI_DB_PASSWORD}
 
     volumes:
       - ./spark/jobs:/opt/spark/jobs
@@ -95,6 +123,12 @@ services:
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY}
       RUSTFS_REGION: ${RUSTFS_REGION}
+
+      BI_DB_HOST: ${BI_DB_HOST}
+      BI_DB_PORT: ${BI_DB_PORT}
+      BI_DB_NAME: ${BI_DB_NAME}
+      BI_DB_USER: ${BI_DB_USER}
+      BI_DB_PASSWORD: ${BI_DB_PASSWORD}
 
     volumes:
       - ./spark/jobs:/opt/spark/jobs
@@ -202,6 +236,10 @@ services:
 
     command: api-server
 
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./data:/opt/spark/data
+
     ports:
       - "8080:8080"
 
@@ -222,6 +260,12 @@ services:
     container_name: lakehouse-airflow-scheduler
 
     command: scheduler
+
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./data:/opt/spark/data
+      - ./spark/jobs:/opt/spark/jobs
+
 
     healthcheck:
       test:
