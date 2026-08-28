@@ -1,0 +1,848 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col,
+    countDistinct,
+    date_format,
+    dayofmonth,
+    first,
+    month,
+    quarter,
+    round,
+    year,
+    row_number,
+)
+from pyspark.sql.types import DecimalType
+from pyspark.sql.window import Window
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+SILVER_PATH = "/opt/spark/data/silver-delta/sales"
+
+GOLD_BASE_PATH = "/opt/spark/data/gold-delta"
+
+DIM_DATE_PATH = f"{GOLD_BASE_PATH}/dim_date"
+DIM_PRODUCT_PATH = f"{GOLD_BASE_PATH}/dim_product"
+DIM_CUSTOMER_PATH = f"{GOLD_BASE_PATH}/dim_customer"
+DIM_REGION_PATH = f"{GOLD_BASE_PATH}/dim_region"
+FACT_SALES_PATH = f"{GOLD_BASE_PATH}/fact_sales"
+
+
+# ============================================================
+# CREATION SESSION SPARK
+# ============================================================
+
+def create_spark_session():
+    """
+    Crée une session Spark configurée pour Delta Lake.
+    """
+
+    return (
+        SparkSession.builder
+        .appName("SilverToGoldDelta")
+        .master("spark://spark:7077")
+        .config(
+            "spark.sql.extensions",
+            "io.delta.sql.DeltaSparkSessionExtension",
+        )
+        .config(
+            "spark.sql.catalog.spark_catalog",
+            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+        )
+        .getOrCreate()
+    )
+
+
+# ============================================================
+# ECRITURE DELTA
+# ============================================================
+
+def write_delta(df, path, table_name):
+    """
+    Ecrit un DataFrame au format Delta Lake.
+    """
+
+    print(f"\n=== ECRITURE {table_name} ===")
+
+    (
+        df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .save(path)
+    )
+
+    print(f"{table_name} écrite dans : {path}")
+
+
+# ============================================================
+# DIM DATE
+# ============================================================
+
+def create_dim_date(df_silver):
+    """
+    Crée la dimension Date.
+
+    Une ligne par date de vente.
+    date_key utilise le format YYYYMMDD.
+    """
+
+    print("\n========================================")
+    print("CREATION DIM_DATE")
+    print("========================================")
+
+    dim_date = (
+        df_silver
+        .select(
+            col("sale_date").alias("full_date")
+        )
+        .dropDuplicates(["full_date"])
+        .withColumn(
+            "date_key",
+            date_format(
+                col("full_date"),
+                "yyyyMMdd",
+            ).cast("int"),
+        )
+        .withColumn(
+            "year",
+            year(col("full_date")),
+        )
+        .withColumn(
+            "quarter",
+            quarter(col("full_date")),
+        )
+        .withColumn(
+            "month",
+            month(col("full_date")),
+        )
+        .withColumn(
+            "day",
+            dayofmonth(col("full_date")),
+        )
+        .select(
+            "date_key",
+            "full_date",
+            "year",
+            "quarter",
+            "month",
+            "day",
+        )
+        .orderBy("date_key")
+    )
+
+    print(
+        "Nombre de lignes DimDate :",
+        dim_date.count(),
+    )
+
+    dim_date.show(
+        10,
+        truncate=False,
+    )
+
+    return dim_date
+
+
+# ============================================================
+# DIM PRODUCT
+# ============================================================
+
+def create_dim_product(df_silver):
+    """
+    Crée la dimension Produit.
+
+    product_id = clé métier provenant de la source.
+    product_key = clé technique de la dimension Gold.
+    """
+
+    print("\n========================================")
+    print("CREATION DIM_PRODUCT")
+    print("========================================")
+
+    # Vérification :
+    # un product_id ne doit pas être associé
+    # à plusieurs noms différents.
+    inconsistent_products = (
+        df_silver
+        .groupBy("product_id")
+        .agg(
+            countDistinct("product_name")
+            .alias("product_name_count")
+        )
+        .filter(
+            col("product_name_count") > 1
+        )
+        .count()
+    )
+
+    print(
+        "Produits avec noms incohérents :",
+        inconsistent_products,
+    )
+
+    if inconsistent_products != 0:
+        raise RuntimeError(
+            "Incohérence détectée : "
+            "un product_id possède plusieurs product_name."
+        )
+
+    product_window = Window.orderBy("product_id")
+
+    dim_product = (
+        df_silver
+        .groupBy("product_id")
+        .agg(
+            first(
+                "product_name",
+                ignorenulls=True,
+            ).alias("product_name")
+        )
+        .withColumn(
+            "product_key",
+            row_number()
+            .over(product_window)
+            .cast("int"),
+        )
+        .select(
+            "product_key",
+            "product_id",
+            "product_name",
+        )
+        .orderBy("product_key")
+    )
+
+    print(
+        "Nombre de lignes DimProduct :",
+        dim_product.count(),
+    )
+
+    dim_product.show(
+        10,
+        truncate=False,
+    )
+
+    return dim_product
+
+
+# ============================================================
+# DIM CUSTOMER
+# ============================================================
+
+def create_dim_customer(df_silver):
+    """
+    Crée la dimension Client.
+
+    La source actuelle contient uniquement customer_id
+    comme information descriptive du client.
+    """
+
+    print("\n========================================")
+    print("CREATION DIM_CUSTOMER")
+    print("========================================")
+
+    customer_window = Window.orderBy("customer_id")
+
+    dim_customer = (
+        df_silver
+        .select("customer_id")
+        .dropDuplicates(["customer_id"])
+        .withColumn(
+            "customer_key",
+            row_number()
+            .over(customer_window)
+            .cast("int"),
+        )
+        .select(
+            "customer_key",
+            "customer_id",
+        )
+        .orderBy("customer_key")
+    )
+
+    print(
+        "Nombre de lignes DimCustomer :",
+        dim_customer.count(),
+    )
+
+    dim_customer.show(
+        10,
+        truncate=False,
+    )
+
+    return dim_customer
+
+
+# ============================================================
+# DIM REGION
+# ============================================================
+
+def create_dim_region(df_silver):
+    """
+    Crée la dimension Région.
+
+    Une ligne par région unique.
+    region_key est une clé technique générée dans Gold.
+    """
+
+    print("\n========================================")
+    print("CREATION DIM_REGION")
+    print("========================================")
+
+    # On commence par renommer la colonne source
+    # "region" en "region_name".
+    dim_region_base = (
+        df_silver
+        .select(
+            col("region").alias("region_name")
+        )
+        .dropDuplicates(["region_name"])
+    )
+
+    # IMPORTANT :
+    # Après le renommage précédent, la colonne s'appelle
+    # "region_name" et non plus "region".
+    region_window = Window.orderBy("region_name")
+
+    dim_region = (
+        dim_region_base
+        .withColumn(
+            "region_key",
+            row_number()
+            .over(region_window)
+            .cast("int"),
+        )
+        .select(
+            "region_key",
+            "region_name",
+        )
+        .orderBy("region_key")
+    )
+
+    print(
+        "Nombre de lignes DimRegion :",
+        dim_region.count(),
+    )
+
+    dim_region.show(
+        10,
+        truncate=False,
+    )
+
+    return dim_region
+
+
+# ============================================================
+# FACT SALES
+# ============================================================
+
+def create_fact_sales(
+    df_silver,
+    dim_date,
+    dim_product,
+    dim_customer,
+    dim_region,
+):
+    """
+    Crée la table de faits FactSales.
+
+    Grain :
+    une ligne = une vente provenant de Silver.
+    """
+
+    print("\n========================================")
+    print("CREATION FACT_SALES")
+    print("========================================")
+
+    silver = df_silver.alias("s")
+
+    dates = (
+        dim_date
+        .select(
+            "date_key",
+            "full_date",
+        )
+        .alias("d")
+    )
+
+    products = (
+        dim_product
+        .select(
+            "product_key",
+            "product_id",
+        )
+        .alias("p")
+    )
+
+    customers = (
+        dim_customer
+        .select(
+            "customer_key",
+            "customer_id",
+        )
+        .alias("c")
+    )
+
+    regions = (
+        dim_region
+        .select(
+            "region_key",
+            "region_name",
+        )
+        .alias("r")
+    )
+
+    fact_sales = (
+        silver
+        .join(
+            dates,
+            col("s.sale_date")
+            == col("d.full_date"),
+            "left",
+        )
+        .join(
+            products,
+            col("s.product_id")
+            == col("p.product_id"),
+            "left",
+        )
+        .join(
+            customers,
+            col("s.customer_id")
+            == col("c.customer_id"),
+            "left",
+        )
+        .join(
+            regions,
+            col("s.region")
+            == col("r.region_name"),
+            "left",
+        )
+        .select(
+            col("s.id")
+            .alias("sale_id"),
+
+            col("d.date_key"),
+
+            col("p.product_key"),
+
+            col("c.customer_key"),
+
+            col("r.region_key"),
+
+            col("s.quantity"),
+
+            col("s.unit_price"),
+
+            round(
+                col("s.quantity")
+                * col("s.unit_price"),
+                2,
+            )
+            .cast(DecimalType(18, 2))
+            .alias("total_amount"),
+
+            col("s.created_at"),
+        )
+    )
+
+    print(
+        "Nombre de lignes FactSales :",
+        fact_sales.count(),
+    )
+
+    fact_sales.show(
+        10,
+        truncate=False,
+    )
+
+    return fact_sales
+
+
+# ============================================================
+# VALIDATION GOLD
+# ============================================================
+
+def validate_gold(
+    df_silver,
+    dim_date,
+    dim_product,
+    dim_customer,
+    dim_region,
+    fact_sales,
+):
+    """
+    Contrôles de qualité du schéma Gold.
+    """
+
+    print("\n========================================")
+    print("VALIDATION GOLD")
+    print("========================================")
+
+    silver_count = df_silver.count()
+    fact_count = fact_sales.count()
+
+    print(
+        "Nombre de lignes Silver :",
+        silver_count,
+    )
+
+    print(
+        "Nombre de lignes FactSales :",
+        fact_count,
+    )
+
+    if fact_count != silver_count:
+        raise RuntimeError(
+            "FactSales ne contient pas le même "
+            "nombre de lignes que Silver."
+        )
+
+    # --------------------------------------------------------
+    # Vérification des clés étrangères
+    # --------------------------------------------------------
+
+    null_date_keys = (
+        fact_sales
+        .filter(
+            col("date_key").isNull()
+        )
+        .count()
+    )
+
+    null_product_keys = (
+        fact_sales
+        .filter(
+            col("product_key").isNull()
+        )
+        .count()
+    )
+
+    null_customer_keys = (
+        fact_sales
+        .filter(
+            col("customer_key").isNull()
+        )
+        .count()
+    )
+
+    null_region_keys = (
+        fact_sales
+        .filter(
+            col("region_key").isNull()
+        )
+        .count()
+    )
+
+    print(
+        "date_key NULL :",
+        null_date_keys,
+    )
+
+    print(
+        "product_key NULL :",
+        null_product_keys,
+    )
+
+    print(
+        "customer_key NULL :",
+        null_customer_keys,
+    )
+
+    print(
+        "region_key NULL :",
+        null_region_keys,
+    )
+
+    if (
+        null_date_keys != 0
+        or null_product_keys != 0
+        or null_customer_keys != 0
+        or null_region_keys != 0
+    ):
+        raise RuntimeError(
+            "Des clés étrangères sont NULL dans FactSales."
+        )
+
+    # --------------------------------------------------------
+    # Vérification unicité sale_id
+    # --------------------------------------------------------
+
+    duplicate_sales = (
+        fact_sales
+        .groupBy("sale_id")
+        .count()
+        .filter(
+            col("count") > 1
+        )
+        .count()
+    )
+
+    print(
+        "sale_id dupliqués :",
+        duplicate_sales,
+    )
+
+    if duplicate_sales != 0:
+        raise RuntimeError(
+            "Des sale_id dupliqués existent dans FactSales."
+        )
+
+    # --------------------------------------------------------
+    # Vérification total_amount
+    # --------------------------------------------------------
+
+    invalid_total_amount = (
+        fact_sales
+        .filter(
+            col("total_amount") < 0
+        )
+        .count()
+    )
+
+    print(
+        "total_amount négatifs :",
+        invalid_total_amount,
+    )
+
+    if invalid_total_amount != 0:
+        raise RuntimeError(
+            "Des total_amount négatifs existent."
+        )
+
+    # --------------------------------------------------------
+    # Résumé dimensions
+    # --------------------------------------------------------
+
+    print("\n=== RESUME STAR SCHEMA ===")
+
+    print(
+        "DimDate :",
+        dim_date.count(),
+        "lignes",
+    )
+
+    print(
+        "DimProduct :",
+        dim_product.count(),
+        "lignes",
+    )
+
+    print(
+        "DimCustomer :",
+        dim_customer.count(),
+        "lignes",
+    )
+
+    print(
+        "DimRegion :",
+        dim_region.count(),
+        "lignes",
+    )
+
+    print(
+        "FactSales :",
+        fact_count,
+        "lignes",
+    )
+
+
+# ============================================================
+# RELECTURE GOLD
+# ============================================================
+
+def validate_delta_storage(spark):
+    """
+    Relit les tables Delta écrites sur disque
+    afin de vérifier leur persistance.
+    """
+
+    print("\n========================================")
+    print("RELECTURE DES TABLES GOLD DELTA")
+    print("========================================")
+
+    tables = {
+        "DimDate": DIM_DATE_PATH,
+        "DimProduct": DIM_PRODUCT_PATH,
+        "DimCustomer": DIM_CUSTOMER_PATH,
+        "DimRegion": DIM_REGION_PATH,
+        "FactSales": FACT_SALES_PATH,
+    }
+
+    for table_name, path in tables.items():
+
+        df = (
+            spark.read
+            .format("delta")
+            .load(path)
+        )
+
+        row_count = df.count()
+
+        print(
+            f"{table_name} relue depuis Delta : "
+            f"{row_count} lignes"
+        )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    spark = create_spark_session()
+
+    print("========================================")
+    print("SILVER -> GOLD DELTA LAKE")
+    print("========================================")
+
+    try:
+
+        # ----------------------------------------------------
+        # 1. LECTURE SILVER DELTA
+        # ----------------------------------------------------
+
+        print("\n=== LECTURE SILVER DELTA ===")
+
+        df_silver = (
+            spark.read
+            .format("delta")
+            .load(SILVER_PATH)
+        )
+
+        df_silver.cache()
+
+        silver_count = df_silver.count()
+
+        print(
+            "Nombre de lignes Silver :",
+            silver_count,
+        )
+
+        print("\n=== SCHEMA SILVER ===")
+
+        df_silver.printSchema()
+
+        # ----------------------------------------------------
+        # 2. CREATION DIMENSIONS
+        # ----------------------------------------------------
+
+        dim_date = create_dim_date(
+            df_silver
+        )
+
+        dim_product = create_dim_product(
+            df_silver
+        )
+
+        dim_customer = create_dim_customer(
+            df_silver
+        )
+
+        dim_region = create_dim_region(
+            df_silver
+        )
+
+        # ----------------------------------------------------
+        # 3. CREATION TABLE DE FAITS
+        # ----------------------------------------------------
+
+        fact_sales = create_fact_sales(
+            df_silver,
+            dim_date,
+            dim_product,
+            dim_customer,
+            dim_region,
+        )
+
+        # ----------------------------------------------------
+        # 4. VALIDATION AVANT ECRITURE
+        # ----------------------------------------------------
+
+        validate_gold(
+            df_silver,
+            dim_date,
+            dim_product,
+            dim_customer,
+            dim_region,
+            fact_sales,
+        )
+
+        # ----------------------------------------------------
+        # 5. ECRITURE GOLD DELTA
+        # ----------------------------------------------------
+
+        print("\n========================================")
+        print("ECRITURE GOLD DELTA")
+        print("========================================")
+
+        write_delta(
+            dim_date,
+            DIM_DATE_PATH,
+            "DimDate",
+        )
+
+        write_delta(
+            dim_product,
+            DIM_PRODUCT_PATH,
+            "DimProduct",
+        )
+
+        write_delta(
+            dim_customer,
+            DIM_CUSTOMER_PATH,
+            "DimCustomer",
+        )
+
+        write_delta(
+            dim_region,
+            DIM_REGION_PATH,
+            "DimRegion",
+        )
+
+        write_delta(
+            fact_sales,
+            FACT_SALES_PATH,
+            "FactSales",
+        )
+
+        # ----------------------------------------------------
+        # 6. RELECTURE TABLES DELTA
+        # ----------------------------------------------------
+
+        validate_delta_storage(
+            spark
+        )
+
+        print("\n========================================")
+        print("SILVER -> GOLD DELTA : SUCCESS")
+        print("========================================")
+
+    except Exception as error:
+
+        print("\n========================================")
+        print("SILVER -> GOLD DELTA : FAILED")
+        print("========================================")
+
+        print(
+            "Erreur :",
+            str(error),
+        )
+
+        raise
+
+    finally:
+
+        try:
+            df_silver.unpersist()
+        except Exception:
+            pass
+
+        spark.stop()
+
+
+if __name__ == "__main__":
+    main()
